@@ -1,4 +1,4 @@
-module github.com/zixyos/goload
+module github.com/zixyos/goloader
 
 go 1.23.4
 
