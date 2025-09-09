@@ -87,6 +87,7 @@ func (c *config) load() error {
   return nil
 }
 
+// Load will load the configuration
 func Load(target interface{}, options ...Option) error {
   conf := config{
     target: target,
