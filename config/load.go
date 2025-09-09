@@ -4,6 +4,7 @@ import (
 	"embed"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 
 	"github.com/knadh/koanf/parsers/toml"
@@ -19,37 +20,53 @@ type PostLoad interface {
 }
 
 type config struct {
-  target  interface{}
-  configLoader *koanf.Koanf
-  fname  string
-  fs *embed.FS
-  logger *slog.Logger
+	target       interface{}
+	configLoader *koanf.Koanf
+	fname        string
+	fs           *embed.FS
+	logger       *slog.Logger
 }
 
-
 func (c *config) loadFromFs() error {
-  if err := c.configLoader.Load(
-    fs.Provider(*c.fs, c.fname),
-    toml.Parser(),
-  ); err != nil {
-    return fmt.Errorf("error loading config file from fs: %w", err)
-  }
+	if err := c.configLoader.Load(
+		fs.Provider(*c.fs, c.fname),
+		toml.Parser(),
+	); err != nil {
+		return fmt.Errorf("error loading config file from fs: %w", err)
+	}
 
-  return nil
+	return nil
 }
 
 func (c *config) loadFromLocal() error {
-  if err := c.configLoader.Load(
-    file.Provider(c.fname),
-    toml.Parser(),
-  ); err != nil {
-    return fmt.Errorf("error loading config file from file: %w", err)
-  }
+	if err := c.configLoader.Load(
+		file.Provider(c.fname),
+		toml.Parser(),
+	); err != nil {
+		return fmt.Errorf("error loading config file from file: %w", err)
+	}
 
-  return nil
+	return nil
 }
 
 func (c *config) loadFile() error {
+	if c.fname == "" {
+		env := os.Getenv("APP_ENV")
+
+		switch env {
+		case "dev", "development":
+			c.fname = "config.dev.toml"
+		case "test", "testing":
+			c.fname = "config.test.toml"
+		case "staging", "stage":
+			c.fname = "config.staging.toml"
+		case "prod", "production":
+			c.fname = "config.prod.toml"
+		default:
+			c.fname = "config.dev.toml"
+		}
+	}
+
 	if c.fname == "" {
 		return nil
 	}
@@ -62,9 +79,9 @@ func (c *config) loadFile() error {
 }
 
 func (c *config) load() error {
-  c.configLoader = koanf.New(".")
+	c.configLoader = koanf.New(".")
 
-  if err := c.loadFile(); err != nil {
+	if err := c.loadFile(); err != nil {
 		return fmt.Errorf("error loading file: %w", err)
 	}
 
@@ -84,24 +101,24 @@ func (c *config) load() error {
 		}
 	}
 
-  return nil
+	return nil
 }
 
 // Load will load the configuration
 func Load(target interface{}, options ...Option) error {
-  conf := config{
-    target: target,
-  }
+	conf := config{
+		target: target,
+	}
 
-  for _, opt := range options {
-    if err := opt(&conf); err != nil {
-      return err
-    }
-  }
+	for _, opt := range options {
+		if err := opt(&conf); err != nil {
+			return err
+		}
+	}
 
-  if conf.logger == nil {
-    conf.logger = slog.Default();
-  }
+	if conf.logger == nil {
+		conf.logger = slog.Default()
+	}
 
-  return conf.load()
+	return conf.load()
 }
