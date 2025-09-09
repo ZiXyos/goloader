@@ -1,4 +1,4 @@
-module github.com/hoppermq/service-loader
+module github.com/zixyos/goload
 
 go 1.23.4
 
