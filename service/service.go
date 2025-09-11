@@ -11,6 +11,7 @@ import (
 	"time"
 )
 
+// Service represnt the contract for a service to be run.
 type Service interface {
   Name() string
   Run(ctx context.Context) error
@@ -18,26 +19,28 @@ type Service interface {
   SetServiceID(serviceID string)
 }
 
+// Config represent the application configuration settings.
 type Config struct {
   ShutdownTimeout time.Duration  `default:"10s"     koanf:"shutdownTimeout"`
 }
 
+// Application represent the structure of a service orchestrator.
 type Application struct {
   conf Config
+
   name string
   version string
   id  string
 
-  logger *slog.Logger
-  services []Service
-  running chan bool
+  logger slog.Logger
+  services []Service 
+	running chan bool
   stop chan os.Signal
 }
 
-// new create a new service instance
+// New create a new service instance
 func New(opts ...Option) *Application {
   app := &Application{
-    conf: Config{},
     stop: make(chan os.Signal, 1),
     running: make(chan bool, 1),
   }
@@ -50,22 +53,24 @@ func New(opts ...Option) *Application {
 // Run run each service in a separate goroutine
 func (a* Application) Run() {
   ctx := context.Background();
-  for _, service := range a.services {
-    service.SetServiceID(a.id)
+  signal.Notify(a.stop, syscall.SIGINT, syscall.SIGTERM)
 
-    go func() {
-      if err := service.Run(ctx); err != nil {
+  for _, service := range a.services {
+    go func(svc Service) {
+			svc.SetServiceID(a.id)
+
+      if err := svc.Run(ctx); err != nil {
         a.logger.Error(
-          "failed to start service id:",
+          "failed to start service",
           slog.String("service", service.Name()),
           slog.String("err", err.Error()),
-          )
+				)
+
         a.stop <- syscall.SIGTERM
       }
-    }()
+    }(service)
   }
 
-  signal.Notify(a.stop, syscall.SIGINT, syscall.SIGTERM)
   a.running <- true
   <-a.stop
 
@@ -77,12 +82,11 @@ func (a* Application) Run() {
   }
 
   select {
-  case <- stopCtx.Done():
-    a.logger.Warn("failed to shutdown services before timeout")
-  default:
-    a.logger.Info("service shutdown")
-}
-
+		case <- stopCtx.Done():
+			a.logger.Warn("failed to shutdown services before timeout")
+		default:
+			a.logger.Info("service shutdown")
+	}
 }
 
 func (a *Application) shutdown(ctx context.Context) error {
@@ -90,6 +94,7 @@ func (a *Application) shutdown(ctx context.Context) error {
 
   for _, service := range a.services {
     if serviceErr := service.Stop(ctx); serviceErr != nil {
+			a.logger.Warn("service failed to shutdown", "service_name", service, "error", serviceErr)
       err = errors.Join(err, fmt.Errorf("%s shutdown: %w", service.Name(), serviceErr))
     }
   }
