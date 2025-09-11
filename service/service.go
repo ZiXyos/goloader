@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -36,6 +37,8 @@ type Application struct {
   services []Service 
 	running chan bool
   stop chan os.Signal
+
+	wg *sync.WaitGroup
 }
 
 // New create a new service instance
@@ -43,6 +46,7 @@ func New(opts ...Option) *Application {
   app := &Application{
     stop: make(chan os.Signal, 1),
     running: make(chan bool, 1),
+		wg: new(sync.WaitGroup),
   }
   for _, opt := range opts {
     opt(app)
@@ -51,12 +55,14 @@ func New(opts ...Option) *Application {
 }
 
 // Run run each service in a separate goroutine
-func (a* Application) Run() {
-  ctx := context.Background();
+func (a* Application) Run(ctx context.Context) {
+	a.wg.Add(1)
+
   signal.Notify(a.stop, syscall.SIGINT, syscall.SIGTERM)
 
   for _, service := range a.services {
     go func(svc Service) {
+			defer a.wg.Done()
 			svc.SetServiceID(a.id)
 
       if err := svc.Run(ctx); err != nil {
@@ -81,12 +87,8 @@ func (a* Application) Run() {
     a.logger.Error("failed to shutdown one or more services", slog.String("err", err.Error()))
   }
 
-  select {
-		case <- stopCtx.Done():
-			a.logger.Warn("failed to shutdown services before timeout")
-		default:
-			a.logger.Info("service shutdown")
-	}
+		stopCtx.Done()
+		a.logger.Info("service shutdown")
 }
 
 func (a *Application) shutdown(ctx context.Context) error {
