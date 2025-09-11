@@ -27,7 +27,7 @@ func WithService(services ...Service) Option {
   }
 }
 
-func WithLogger(logger slog.Logger) Option {
+func WithLogger(logger *slog.Logger) Option {
   return func(a *Application) {
     a.logger = logger
   }

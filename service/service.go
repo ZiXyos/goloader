@@ -33,7 +33,8 @@ type Application struct {
   name 		string
   version string
 
-  logger 	slog.Logger
+  logger *slog.Logger
+
   stop 		chan os.Signal
 	running chan bool
 
