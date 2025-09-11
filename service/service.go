@@ -29,14 +29,15 @@ type Config struct {
 type Application struct {
   conf Config
 
-  name string
+  id  		string
+  name 		string
   version string
-  id  string
 
-  logger slog.Logger
-  services []Service 
+  logger 	slog.Logger
+  stop 		chan os.Signal
 	running chan bool
-  stop chan os.Signal
+
+  services []Service 
 
 	wg *sync.WaitGroup
 }
