@@ -54,6 +54,8 @@ func (c *config) loadFile() error {
 		env := os.Getenv("APP_ENV")
 
 		switch env {
+		case "local":
+			c.fname = "config.local.toml"
 		case "dev", "development":
 			c.fname = "config.dev.toml"
 		case "test", "testing":
