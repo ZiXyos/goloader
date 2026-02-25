@@ -80,6 +80,11 @@ func (c *config) loadFile() error {
 	return c.loadFromLocal()
 }
 
+// LoadFromEnv load value from env.
+func (c *config) LoadFromEnv() error {
+	return nil
+}
+
 func (c *config) load() error {
 	c.configLoader = koanf.New(".")
 
