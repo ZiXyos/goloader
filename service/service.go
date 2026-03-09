@@ -1,5 +1,7 @@
 package serviceloader
 
+//go:generate mockery
+
 import (
 	"context"
 	"errors"
@@ -12,96 +14,101 @@ import (
 	"time"
 )
 
+type UUID [16]byte
+type Generator func() UUID
+
 // Service represnt the contract for a service to be run.
 type Service interface {
-  Name() string
-  Run(ctx context.Context) error
-  Stop(ctx context.Context) error
-  SetServiceID(serviceID string)
+	Name() string
+	Run(ctx context.Context) error
+	Stop(ctx context.Context) error
+	SetServiceID(serviceID UUID)
 }
 
 // Config represent the application configuration settings.
 type Config struct {
-  ShutdownTimeout time.Duration  `default:"10s"     koanf:"shutdownTimeout"`
+	ShutdownTimeout time.Duration `default:"10s"     koanf:"shutdownTimeout"`
 }
 
 // Application represent the structure of a service orchestrator.
 type Application struct {
-  conf Config
+	conf Config
 
-  id  		string
-  name 		string
-  version string
+	id      string
+	name    string
+	version string
 
-  logger *slog.Logger
+	logger *slog.Logger
 
-  stop 		chan os.Signal
+	stop    chan os.Signal
 	running chan bool
 
-  services []Service 
+	services []Service
 
 	wg *sync.WaitGroup
+
+	generator Generator
 }
 
 // New create a new service instance
 func New(opts ...Option) *Application {
-  app := &Application{
-    stop: make(chan os.Signal, 1),
-    running: make(chan bool, 1),
-		wg: new(sync.WaitGroup),
-  }
-  for _, opt := range opts {
-    opt(app)
-  }
-  return app
+	app := &Application{
+		stop:    make(chan os.Signal, 1),
+		running: make(chan bool, 1),
+		wg:      new(sync.WaitGroup),
+	}
+	for _, opt := range opts {
+		opt(app)
+	}
+	return app
 }
 
 // Run run each service in a separate goroutine
-func (a* Application) Run(ctx context.Context) {
+func (a *Application) Run(ctx context.Context) {
 	a.wg.Add(1)
 
-  signal.Notify(a.stop, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(a.stop, syscall.SIGINT, syscall.SIGTERM)
 
-  for _, service := range a.services {
-    go func(svc Service) {
+	for _, service := range a.services {
+		go func(svc Service) {
 			defer a.wg.Done()
-			svc.SetServiceID(a.id)
+			svc.SetServiceID(a.generator())
 
-      if err := svc.Run(ctx); err != nil {
-        a.logger.Error(
-          "failed to start service",
-          slog.String("service", service.Name()),
-          slog.String("err", err.Error()),
+			if err := svc.Run(ctx); err != nil {
+				a.logger.Error(
+					"failed to start service",
+					slog.String("service", service.Name()),
+					slog.String("err", err.Error()),
 				)
 
-        a.stop <- syscall.SIGTERM
-      }
-    }(service)
-  }
+				a.stop <- syscall.SIGTERM
+			}
+		}(service)
+	}
 
-  a.running <- true
-  <-a.stop
+	a.running <- true
+	<-a.stop
 
-  stopCtx, cancel := context.WithTimeout(ctx, a.conf.ShutdownTimeout)
-  defer cancel()
+	stopCtx, cancel := context.WithTimeout(ctx, a.conf.ShutdownTimeout)
+	defer cancel()
 
-  if err := a.shutdown(stopCtx); err != nil {
-    a.logger.Error("failed to shutdown one or more services", slog.String("err", err.Error()))
-  }
+	if err := a.shutdown(stopCtx); err != nil {
+		a.logger.Error("failed to shutdown one or more services", slog.String("err", err.Error()))
+	}
 
-		stopCtx.Done()
-		a.logger.Info("service shutdown")
+	stopCtx.Done()
+	a.logger.Info("service shutdown")
 }
 
 func (a *Application) shutdown(ctx context.Context) error {
-  var err error
+	var err error
 
-  for _, service := range a.services {
-    if serviceErr := service.Stop(ctx); serviceErr != nil {
+	for _, service := range a.services {
+		if serviceErr := service.Stop(ctx); serviceErr != nil {
 			a.logger.Warn("service failed to shutdown", "service_name", service, "error", serviceErr)
-      err = errors.Join(err, fmt.Errorf("%s shutdown: %w", service.Name(), serviceErr))
-    }
-  }
+			err = errors.Join(err, fmt.Errorf("%s shutdown: %w", service.Name(), serviceErr))
+		}
+	}
 
-  return err
+	return err
 }
