@@ -25,9 +25,16 @@ func WithConfig(cfg *Config) Option {
 	})
 }
 
-func WithComponent(c ...Component) Option {
+func WithComponent(cmp ...Component) Option {
 	return optionFunc(func(m *Manager) {
-		m.components = c
+		for _, c := range cmp {
+			e := &entry{component: c}
+			if o, ok := c.(optional); ok {
+				e.component, e.optional = o.Component, true
+			}
+
+			m.entries = append(m.entries, e)
+		}
 	})
 }
 

@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,7 +17,6 @@ type Component interface {
 	Open(ctx context.Context) error
 	Close(ctx context.Context) error
 	Name() string
-	isOptional() bool
 }
 
 type Healthchecker interface {
@@ -28,6 +28,15 @@ type Config struct {
 	HealthCheckInterval time.Duration `default:"10s" koanf:"health_check_interval"`
 }
 
+type entry struct {
+	component Component
+
+	optional  bool
+	attempted bool
+
+	healthy atomic.Bool
+}
+
 type Manager struct {
 	logger *slog.Logger
 	cfg    *Config
@@ -35,11 +44,13 @@ type Manager struct {
 	stop    chan os.Signal
 	running chan bool
 
-	components []Component
+	entries []*entry
 
 	wg                  *sync.WaitGroup
 	healthCheckInterval time.Duration
 }
+
+type optional struct{ Component }
 
 func New(opts ...Option) (*Manager, error) {
 	m := &Manager{
@@ -62,55 +73,56 @@ func New(opts ...Option) (*Manager, error) {
 	return m, nil
 }
 
-func (m *Manager) Optional(ctx context.Context) error {
-	return nil
+func (m *Manager) Optional(o Component) Component {
+	return optional{o}
 }
 
 func (m *Manager) Open(ctx context.Context) error {
-	for _, component := range m.components {
-		m.wg.Add(1)
-		go func(cmp Component) {
-			defer m.wg.Done()
-			if err := cmp.Open(ctx); err != nil {
-				m.logger.WarnContext(
-					ctx,
-					"failed to ping component",
-					slog.String("component", cmp.Name()),
-					slog.String("error", err.Error()),
-				)
+	for i, e := range m.entries {
+		e.attempted = true
+		err := e.component.Open(ctx)
+		e.healthy.Store(err == nil)
+		if err == nil {
+			continue
+		}
 
-				m.stop <- syscall.SIGTERM
-			}
-		}(component)
+		if e.optional {
+			m.logger.WarnContext(
+				ctx,
+				"optioan component failed to open, continuing with default fallback",
+				slog.String("component", e.component.Name()),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+
+		openErr := fmt.Errorf("open %s: %w", e.component.Name(), err)
+		closeErr := m.close(context.WithoutCancel(ctx), m.entries[:i+1])
+
+		return errors.Join(openErr, closeErr)
 	}
 
-	m.running <- true
-	<-m.stop
-
-	stopCtx, cancel := context.WithTimeout(ctx, m.cfg.ShutdownTimeout)
-	defer cancel()
-
-	if err := m.shutdown(stopCtx); err != nil {
-		m.logger.Error(
-			"failed to shutdown one or more component",
-			slog.String("error", err.Error()),
-		)
-	}
-
-	stopCtx.Done()
-	m.logger.Info("component killed")
 	return nil
 }
 
-func (m *Manager) shutdown(ctx context.Context) error {
-	var err error
+func (m *Manager) Close(ctx context.Context) error {
+	return m.close(ctx, m.entries)
+}
 
-	for _, component := range m.components {
-		if componentErr := component.Close(ctx); componentErr != nil {
-			m.logger.WarnContext(ctx, "component failed to close", "component_name", component.Name, "error", componentErr.Error())
-			err = errors.Join(err, fmt.Errorf("%s close: %w", component.Name(), componentErr))
+func (m *Manager) close(ctx context.Context, entries []*entry) error {
+	ctx, cancel := context.WithTimeout(ctx, m.cfg.ShutdownTimeout)
+	defer cancel()
+
+	var errs error
+	for _, e := range slices.Backward(entries) {
+		if !e.attempted {
+			continue
+		}
+		e.healthy.Store(false)
+		if err := e.component.Close(ctx); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("close %s: %w", e.component.Name()), err)
 		}
 	}
 
-	return nil
+	return errs
 }
