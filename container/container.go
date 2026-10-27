@@ -4,6 +4,7 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -23,7 +24,8 @@ type Healthchecker interface {
 }
 
 type Config struct {
-	ShutdownTimeout time.Duration `default:"10s" koanf:"shutdownTimeout"`
+	ShutdownTimeout     time.Duration `default:"10s" koanf:"shutdown_timeout"`
+	HealthCheckInterval time.Duration `default:"10s" koanf:"health_check_interval"`
 }
 
 type Manager struct {
@@ -33,35 +35,10 @@ type Manager struct {
 	stop    chan os.Signal
 	running chan bool
 
-	components []*Component
+	components []Component
 
-	wg *sync.WaitGroup
-}
-
-type Option interface {
-	apply(m *Manager)
-}
-
-type optionFunc func(*Manager)
-
-func (f optionFunc) apply(m *Manager) { f(m) }
-
-func WithLogger(l *slog.Logger) Option {
-	return optionFunc(func(m *Manager) {
-		m.logger = l
-	})
-}
-
-func WithConfig(cfg *Config) Option {
-	return optionFunc(func(m *Manager) {
-		m.cfg = cfg
-	})
-}
-
-func WithComponent(c ...*Component) Option {
-	return optionFunc(func(m *Manager) {
-		m.components = c
-	})
+	wg                  *sync.WaitGroup
+	healthCheckInterval time.Duration
 }
 
 func New(opts ...Option) (*Manager, error) {
@@ -85,6 +62,10 @@ func New(opts ...Option) (*Manager, error) {
 	return m, nil
 }
 
+func (m *Manager) Optional(ctx context.Context) error {
+	return nil
+}
+
 func (m *Manager) Open(ctx context.Context) error {
 	for _, component := range m.components {
 		m.wg.Add(1)
@@ -100,16 +81,36 @@ func (m *Manager) Open(ctx context.Context) error {
 
 				m.stop <- syscall.SIGTERM
 			}
-		}(*component)
-
-		m.running <- true
-		<-m.stop
-
-		stopCtx, cancel := context.WithTimeout(ctx, m.cfg.ShutdownTimeout)
-		defer cancel()
-
-		stopCtx.Done()
-		m.logger.Info("component killed")
+		}(component)
 	}
+
+	m.running <- true
+	<-m.stop
+
+	stopCtx, cancel := context.WithTimeout(ctx, m.cfg.ShutdownTimeout)
+	defer cancel()
+
+	if err := m.shutdown(stopCtx); err != nil {
+		m.logger.Error(
+			"failed to shutdown one or more component",
+			slog.String("error", err.Error()),
+		)
+	}
+
+	stopCtx.Done()
+	m.logger.Info("component killed")
+	return nil
+}
+
+func (m *Manager) shutdown(ctx context.Context) error {
+	var err error
+
+	for _, component := range m.components {
+		if componentErr := component.Close(ctx); componentErr != nil {
+			m.logger.WarnContext(ctx, "component failed to close", "component_name", component.Name, "error", componentErr.Error())
+			err = errors.Join(err, fmt.Errorf("%s close: %w", component.Name(), componentErr))
+		}
+	}
+
 	return nil
 }
