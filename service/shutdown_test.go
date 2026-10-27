@@ -89,9 +89,12 @@ func newApp(timeout time.Duration, services ...serviceloader.Service) *servicelo
 	return serviceloader.New(
 		serviceloader.WithLogger(slog.New(slog.NewTextHandler(discard{}, nil))),
 		serviceloader.WithConfig(serviceloader.Config{ShutdownTimeout: timeout}),
+		serviceloader.WithGenerator(zeroID),
 		serviceloader.WithService(services...),
 	)
 }
+
+func zeroID() serviceloader.UUID { return serviceloader.UUID{} }
 
 type discard struct{}
 
@@ -220,6 +223,7 @@ func TestWithService_Accumulates(t *testing.T) {
 
 	app := serviceloader.New(
 		serviceloader.WithLogger(slog.New(slog.NewTextHandler(discard{}, nil))),
+		serviceloader.WithGenerator(zeroID),
 		serviceloader.WithService(a),
 		serviceloader.WithService(b),
 	)
@@ -233,10 +237,29 @@ func TestWithService_Accumulates(t *testing.T) {
 	assert.ElementsMatch(t, []string{"a", "b"}, rec.get())
 }
 
-func TestNew_DefaultsDoNotPanic(t *testing.T) {
+func TestRun_GeneratorRequired(t *testing.T) {
 	svc := newFake("svc", nil)
 
 	app := serviceloader.New(serviceloader.WithService(svc))
+
+	err := app.Run(context.Background())
+	require.ErrorIs(t, err, serviceloader.ErrGeneratorRequired)
+
+	select {
+	case <-svc.returned:
+		t.Fatal("service was started without a generator")
+	default:
+	}
+}
+
+func TestNew_DefaultsDoNotPanic(t *testing.T) {
+	svc := newFake("svc", nil)
+
+	// No logger and no config: both fall back to defaults.
+	app := serviceloader.New(
+		serviceloader.WithGenerator(zeroID),
+		serviceloader.WithService(svc),
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := runAsync(t, ctx, app)

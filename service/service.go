@@ -7,7 +7,6 @@ package serviceloader
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +19,11 @@ import (
 // _defaultShutdownTimeout bounds the shutdown when the configuration does not
 // set one. A zero timeout would hand Stop an already expired context.
 const _defaultShutdownTimeout = 10 * time.Second
+
+// ErrGeneratorRequired is returned by Run when no Generator was provided. The
+// loader has no default on purpose: service identifiers belong to the
+// application's own ID scheme, and a fallback would silently diverge from it.
+var ErrGeneratorRequired = errors.New("serviceloader: generator is required")
 
 // UUID is the identifier given to every service run by an Application.
 type UUID [16]byte
@@ -64,8 +68,9 @@ type Application struct {
 	generator Generator
 }
 
-// New creates a new Application. Missing options fall back to defaults: the
-// default slog logger, a random UUID generator, and a 10s shutdown timeout.
+// New creates a new Application. A missing logger falls back to the default
+// slog logger and a missing shutdown timeout to 10s. The generator has no
+// default; Run fails with ErrGeneratorRequired without one.
 func New(opts ...Option) *Application {
 	app := &Application{}
 	for _, opt := range opts {
@@ -74,10 +79,6 @@ func New(opts ...Option) *Application {
 
 	if app.logger == nil {
 		app.logger = slog.Default()
-	}
-
-	if app.generator == nil {
-		app.generator = randomUUID
 	}
 
 	if app.conf.ShutdownTimeout <= 0 {
@@ -96,8 +97,13 @@ func New(opts ...Option) *Application {
 // the services' dependencies.
 //
 // The returned error joins the service failure that triggered the shutdown, if
-// any, with every error raised while shutting down.
+// any, with every error raised while shutting down. It returns
+// ErrGeneratorRequired, without starting anything, when no Generator was set.
 func (a *Application) Run(ctx context.Context) error {
+	if a.generator == nil {
+		return ErrGeneratorRequired
+	}
+
 	sigCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 
@@ -194,17 +200,4 @@ func wait(ctx context.Context, wg *sync.WaitGroup) error {
 	case <-ctx.Done():
 		return fmt.Errorf("wait for services to return: %w", ctx.Err())
 	}
-}
-
-// randomUUID returns a random (version 4) UUID.
-func randomUUID() UUID {
-	var id UUID
-
-	// crypto/rand.Read never returns an error on supported platforms.
-	_, _ = rand.Read(id[:])
-
-	id[6] = (id[6] & 0x0f) | 0x40
-	id[8] = (id[8] & 0x3f) | 0x80
-
-	return id
 }
