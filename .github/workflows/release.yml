@@ -1,0 +1,120 @@
+# The "button": Actions -> Publish release -> Run workflow.
+# Promotes an RC (latest one by default) to a stable vX.Y.Z on the same
+# commit, publishes the GitHub release and pushes it to the Go proxy and
+# pkg.go.dev.
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc:
+        description: "RC tag to promote (empty = latest RC)"
+        required: false
+        type: string
+      cleanup:
+        description: "Delete the RC pre-releases of this version (tags are kept)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      rc: ${{ steps.r.outputs.rc }}
+      version: ${{ steps.r.outputs.version }}
+      sha: ${{ steps.r.outputs.sha }}
+      stable: ${{ steps.r.outputs.stable }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: r
+        run: |
+          rc="${{ inputs.rc }}"
+          if [ -z "$rc" ]; then
+            rc=$(git tag -l 'v*-rc.*' | sort -V | tail -1)
+          fi
+          [ -n "$rc" ] || { echo "::error::No RC tag found"; exit 1; }
+          git rev-parse -q --verify "refs/tags/$rc" >/dev/null || { echo "::error::Tag $rc not found"; exit 1; }
+
+          version="${rc%-rc.*}"
+          if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
+            echo "::error::$version is already released"; exit 1
+          fi
+          stable=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          sha=$(git rev-list -n1 "$rc")
+
+          echo "Promoting $rc ($sha) -> $version (previous: ${stable:-none})"
+          {
+            echo "rc=$rc"; echo "version=$version"; echo "sha=$sha"; echo "stable=$stable"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+
+  publish:
+    needs: [resolve, test]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Create release
+        run: |
+          start=()
+          [ -n "${{ needs.resolve.outputs.stable }}" ] && start=(--notes-start-tag "${{ needs.resolve.outputs.stable }}")
+          gh release create "$VERSION" \
+            --target "${{ needs.resolve.outputs.sha }}" \
+            --title "$VERSION" \
+            --latest \
+            --generate-notes "${start[@]}"
+
+      - name: Publish to Go proxy and pkg.go.dev
+        run: |
+          mod=$(go list -m)
+          ok=
+          for i in $(seq 1 10); do
+            if GOPROXY=https://proxy.golang.org GOFLAGS=-mod=mod go list -m "$mod@$VERSION"; then
+              ok=1; break
+            fi
+            sleep 15
+          done
+          [ -n "$ok" ] || { echo "::error::proxy.golang.org did not index $VERSION"; exit 1; }
+
+          # Make sure @latest resolves to the new version.
+          GOPROXY=https://proxy.golang.org GOFLAGS=-mod=mod go list -m "$mod@latest"
+
+          # Ask pkg.go.dev to (re)fetch docs. Best effort.
+          curl -fsS -X POST "https://pkg.go.dev/fetch/$mod@$VERSION" -o /dev/null \
+            || echo "::warning::pkg.go.dev fetch request failed (it will catch up on its own)"
+          echo "### Published \`$mod@$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://pkg.go.dev/$mod@$VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up RC pre-releases
+        if: inputs.cleanup
+        run: |
+          for t in $(gh release list --limit 200 --json tagName,isPrerelease \
+              --jq ".[] | select(.isPrerelease) | .tagName | select(startswith(\"$VERSION-rc.\"))"); do
+            echo "Deleting pre-release $t"
+            gh release delete "$t" --yes
+          done

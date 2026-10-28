@@ -1,0 +1,102 @@
+# Every merge to main produces a pre-release vX.Y.Z-rc.N.
+#
+# The bump comes from labels on the merged PR:
+#   release:major  -> X+1.0.0
+#   release:minor  -> X.Y+1.0
+#   (default)      -> X.Y.Z+1
+#   release:skip   -> no RC
+# While an RC cycle is open, the target version only goes up (a patch PR
+# after a minor PR stays on the minor target).
+name: Release candidate
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  rc:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Find bump from merged PR labels
+        id: bump
+        run: |
+          labels=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+            --jq '.[0].labels[]?.name' 2>/dev/null || true)
+          echo "PR labels: ${labels:-<none>}"
+          bump=patch
+          if grep -qx 'release:skip' <<<"$labels"; then bump=skip
+          elif grep -qx 'release:major' <<<"$labels"; then bump=major
+          elif grep -qx 'release:minor' <<<"$labels"; then bump=minor
+          fi
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+
+      - name: Compute RC version
+        if: steps.bump.outputs.bump != 'skip'
+        id: ver
+        run: |
+          stable=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          stable=${stable:-v0.0.0}
+          IFS=. read -r ma mi pa <<<"${stable#v}"
+          case "${{ steps.bump.outputs.bump }}" in
+            major) cand="v$((ma+1)).0.0" ;;
+            minor) cand="v$ma.$((mi+1)).0" ;;
+            *)     cand="v$ma.$mi.$((pa+1))" ;;
+          esac
+
+          # Highest target already used by an RC newer than the last stable.
+          open=$( { echo "$stable"; git tag -l 'v*-rc.*' | sed 's/-rc\..*//'; } \
+            | sort -uV | tail -1)
+          [ "$open" = "$stable" ] && open=""
+          target=$(printf '%s\n%s\n' "$cand" "${open:-$cand}" | sort -V | tail -1)
+
+          n=$(git tag -l "$target-rc.*" | sed 's/.*-rc\.//' | sort -n | tail -1)
+          rc="$target-rc.$(( ${n:-0} + 1 ))"
+
+          echo "stable=$stable target=$target rc=$rc"
+          echo "stable=$stable" >> "$GITHUB_OUTPUT"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Create pre-release
+        if: steps.bump.outputs.bump != 'skip'
+        run: |
+          start=()
+          [ "${{ steps.ver.outputs.stable }}" != "v0.0.0" ] && start=(--notes-start-tag "${{ steps.ver.outputs.stable }}")
+          gh release create "${{ steps.ver.outputs.rc }}" \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --title "${{ steps.ver.outputs.rc }}" \
+            --generate-notes "${start[@]}"
+
+      - name: Warm Go module proxy
+        if: steps.bump.outputs.bump != 'skip'
+        run: |
+          mod=$(go list -m)
+          for i in 1 2 3 4 5; do
+            GOPROXY=https://proxy.golang.org GOFLAGS=-mod=mod \
+              go list -m "$mod@${{ steps.ver.outputs.rc }}" && exit 0
+            sleep 10
+          done
+          echo "::warning::proxy.golang.org did not index ${{ steps.ver.outputs.rc }} yet"
