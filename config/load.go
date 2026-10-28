@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/knadh/koanf/parsers/toml"
-	"github.com/knadh/koanf/providers/env"
+	"github.com/knadh/koanf/parsers/toml/v2"
+	"github.com/knadh/koanf/providers/env/v2"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/providers/fs"
 	"github.com/knadh/koanf/v2"
@@ -87,8 +87,10 @@ func (c *config) load() error {
 		return fmt.Errorf("error loading file: %w", err)
 	}
 
-	if err := c.configLoader.Load(env.Provider("", ".", func(s string) string {
-		return strings.ReplaceAll(strings.ToLower(s), "_", ".")
+	if err := c.configLoader.Load(env.Provider(".", env.Opt{
+		TransformFunc: func(k, v string) (string, any) {
+			return strings.ReplaceAll(strings.ToLower(k), "_", "."), v
+		},
 	}), nil); err != nil {
 		return fmt.Errorf("error loading env variables: %w", err)
 	}

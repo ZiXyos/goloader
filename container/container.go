@@ -168,7 +168,7 @@ func (m *Manager) close(ctx context.Context, entries []*entry) error {
 		}
 		e.healthy.Store(false)
 		if err := e.component.Close(ctx); err != nil {
-			errs = errors.Join(errs, fmt.Errorf("close %s: %w", e.component.Name()), err)
+			errs = errors.Join(errs, fmt.Errorf("close %s: %w", e.component.Name(), err))
 		}
 	}
 
