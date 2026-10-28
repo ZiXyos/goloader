@@ -27,9 +27,11 @@ func WithConfig(config Config) Option {
 	}
 }
 
+// WithService registers services to be run. It can be passed more than once;
+// services accumulate and are started in registration order.
 func WithService(services ...Service) Option {
 	return func(a *Application) {
-		a.services = services
+		a.services = append(a.services, services...)
 	}
 }
 

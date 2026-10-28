@@ -1,3 +1,6 @@
+// Package serviceloader runs long-lived services (HTTP and gRPC servers,
+// workers) as one unit: it starts them, waits for a termination signal or a
+// service failure, then stops them and waits for them to finish.
 package serviceloader
 
 //go:generate mockery
@@ -7,17 +10,36 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 )
 
+// _defaultShutdownTimeout bounds the shutdown when the configuration does not
+// set one. A zero timeout would hand Stop an already expired context.
+const _defaultShutdownTimeout = 10 * time.Second
+
+// ErrGeneratorRequired is returned by Run when no Generator was provided. The
+// loader has no default on purpose: service identifiers belong to the
+// application's own ID scheme, and a fallback would silently diverge from it.
+var ErrGeneratorRequired = errors.New("serviceloader: generator is required")
+
+// UUID is the identifier given to every service run by an Application.
 type UUID [16]byte
+
+// Generator produces service identifiers.
 type Generator func() UUID
 
-// Service represnt the contract for a service to be run.
+// Service represents a long-lived process run by an Application.
+//
+// Run starts the service. It may return as soon as the service is running or
+// block until the service ends; a non-nil error is treated as a failure and
+// shuts the whole Application down.
+//
+// Stop gracefully stops the service. It must return only once the service's
+// in-flight work (requests, jobs) is finished, because the Application treats
+// a returned Stop as the point where the service's dependencies can be closed.
 type Service interface {
 	Name() string
 	Run(ctx context.Context) error
@@ -25,12 +47,13 @@ type Service interface {
 	SetServiceID(serviceID UUID)
 }
 
-// Config represent the application configuration settings.
+// Config represents the application configuration settings.
 type Config struct {
-	ShutdownTimeout time.Duration `default:"10s"     koanf:"shutdownTimeout"`
+	ShutdownTimeout time.Duration `default:"10s" koanf:"shutdownTimeout"`
 }
 
-// Application represent the structure of a service orchestrator.
+// Application orchestrates a set of services. The zero value is not usable;
+// build one with New.
 type Application struct {
 	conf Config
 
@@ -40,75 +63,141 @@ type Application struct {
 
 	logger *slog.Logger
 
-	stop    chan os.Signal
-	running chan bool
-
 	services []Service
-
-	wg *sync.WaitGroup
 
 	generator Generator
 }
 
-// New create a new service instance
+// New creates a new Application. A missing logger falls back to the default
+// slog logger and a missing shutdown timeout to 10s. The generator has no
+// default; Run fails with ErrGeneratorRequired without one.
 func New(opts ...Option) *Application {
-	app := &Application{
-		stop:    make(chan os.Signal, 1),
-		running: make(chan bool, 1),
-		wg:      new(sync.WaitGroup),
-	}
+	app := &Application{}
 	for _, opt := range opts {
 		opt(app)
 	}
+
+	if app.logger == nil {
+		app.logger = slog.Default()
+	}
+
+	if app.conf.ShutdownTimeout <= 0 {
+		app.conf.ShutdownTimeout = _defaultShutdownTimeout
+	}
+
 	return app
 }
 
-// Run run each service in a separate goroutine
-func (a *Application) Run(ctx context.Context) {
-	a.wg.Add(1)
+// Run starts every service in its own goroutine and blocks until ctx is
+// cancelled, the process receives SIGINT or SIGTERM, or a service fails.
+//
+// It then stops the services in reverse registration order and waits for
+// their Run calls to return, all within the configured shutdown timeout. When
+// Run returns, no service is running anymore, so the caller can safely close
+// the services' dependencies.
+//
+// The returned error joins the service failure that triggered the shutdown, if
+// any, with every error raised while shutting down. It returns
+// ErrGeneratorRequired, without starting anything, when no Generator was set.
+func (a *Application) Run(ctx context.Context) error {
+	if a.generator == nil {
+		return ErrGeneratorRequired
+	}
 
-	signal.Notify(a.stop, syscall.SIGINT, syscall.SIGTERM)
+	sigCtx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
 
-	for _, service := range a.services {
-		go func(svc Service) {
-			defer a.wg.Done()
+	// failCtx is cancelled by the first failing service. Services themselves
+	// receive ctx rather than failCtx: shutdown is driven by Stop, so that a
+	// signal never aborts in-flight work before Stop gets to drain it.
+	failCtx, fail := context.WithCancelCause(sigCtx)
+	defer fail(nil)
+
+	var wg sync.WaitGroup
+
+	for _, svc := range a.services {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
 			svc.SetServiceID(a.generator())
 
 			if err := svc.Run(ctx); err != nil {
-				a.logger.Error(
-					"failed to start service",
-					slog.String("service", service.Name()),
-					slog.String("err", err.Error()),
+				a.logger.ErrorContext(ctx, "service failed",
+					slog.String("service", svc.Name()),
+					slog.Any("error", err),
 				)
 
-				a.stop <- syscall.SIGTERM
+				fail(fmt.Errorf("run %s: %w", svc.Name(), err))
 			}
-		}(service)
+		}()
 	}
 
-	a.running <- true
-	<-a.stop
+	<-failCtx.Done()
 
-	stopCtx, cancel := context.WithTimeout(ctx, a.conf.ShutdownTimeout)
+	var runErr error
+	if cause := context.Cause(failCtx); !errors.Is(cause, context.Canceled) {
+		runErr = cause
+	}
+
+	a.logger.InfoContext(ctx, "shutting down services", slog.String("application", a.id))
+
+	// The shutdown gets a fresh deadline: ctx may already be cancelled, which
+	// is often the very reason the shutdown started.
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.conf.ShutdownTimeout)
 	defer cancel()
 
-	if err := a.shutdown(stopCtx); err != nil {
-		a.logger.Error("failed to shutdown one or more services", slog.String("err", err.Error()))
+	shutdownErr := errors.Join(a.shutdown(stopCtx), wait(stopCtx, &wg))
+
+	if shutdownErr != nil {
+		a.logger.ErrorContext(stopCtx, "failed to shut down one or more services",
+			slog.Any("error", shutdownErr),
+		)
+	} else {
+		a.logger.InfoContext(stopCtx, "services shut down", slog.String("application", a.id))
 	}
 
-	stopCtx.Done()
-	a.logger.Info("service shutdown")
+	return errors.Join(runErr, shutdownErr)
 }
 
+// shutdown stops the services in reverse registration order, so a service
+// registered after another, and possibly depending on it, stops first. Every
+// service is stopped even when an earlier one fails.
 func (a *Application) shutdown(ctx context.Context) error {
-	var err error
+	var errs error
 
-	for _, service := range a.services {
-		if serviceErr := service.Stop(ctx); serviceErr != nil {
-			a.logger.Warn("service failed to shutdown", "service_name", service, "error", serviceErr)
-			err = errors.Join(err, fmt.Errorf("%s shutdown: %w", service.Name(), serviceErr))
+	for i := len(a.services) - 1; i >= 0; i-- {
+		svc := a.services[i]
+
+		if err := svc.Stop(ctx); err != nil {
+			a.logger.WarnContext(ctx, "service failed to stop",
+				slog.String("service", svc.Name()),
+				slog.Any("error", err),
+			)
+
+			errs = errors.Join(errs, fmt.Errorf("stop %s: %w", svc.Name(), err))
 		}
 	}
 
-	return err
+	return errs
+}
+
+// wait blocks until every service's Run has returned or ctx expires. On
+// expiry the stuck goroutines are left behind: there is no way to kill them,
+// and the caller is about to exit anyway.
+func wait(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait for services to return: %w", ctx.Err())
+	}
 }
